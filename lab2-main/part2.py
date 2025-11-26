@@ -31,7 +31,7 @@ async def part2_training_loop(model: Model) -> Model:
     for l in range(start, end):
         weights[l],opt_states[l]=model.load_weights(l)
     
-    for microbatch in get_global_batch_list(model.global_batch_size,512):
+    for microbatch in get_global_batch_list(model.global_batch_size,model.global_batch_size):
         
         if rank!=0:
             activations[start] = await model.receive(source=rank-1)
@@ -98,7 +98,7 @@ async def main():
 
     print(f"MFU: {mfu}")
 
-    write_chrome_trace(out, "./debug_traces/part2.json",get_global_batch_list(global_batch_size,512))
+    write_chrome_trace(out, "./debug_traces/part2.json",get_global_batch_list(global_batch_size,global_batch_size))
 
     print(time, memory, max_mem_rank)
 
