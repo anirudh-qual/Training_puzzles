@@ -31,7 +31,7 @@ async def part2_training_loop(model: Model) -> Model:
     for l in range(start, end):
         weights[l],opt_states[l]=model.load_weights(l)
     
-    for microbatch in get_global_batch_list(model.global_batch_size,16):
+    for microbatch in get_global_batch_list(model.global_batch_size,1):
         
         if rank!=0:
             activations[start] = await model.receive(source=rank-1)
