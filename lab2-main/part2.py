@@ -6,56 +6,92 @@ from utils import (
     get_model_theoretical_best_time,
     get_training_stats,
     write_chrome_trace,
-    get_next_microbatch
 )
+from utils import get_global_batch_list
 
-
-async def part1_training_loop(model: Model, batch_size: int) -> Model:
+async def part2_training_loop(model: Model) -> Model:
     """
-    Implement distributed training using ZeRO (Zero Redundancy Optimizer) optimization.
+    Implement distributed training using Pipeline parallelism.
 
-    Shard model parameters, gradients, and optimizer states across GPUs (ranks).
-    Coordinate parameter updates and gradient reductions across GPUs.
-    Implement efficient memory management by only creating the full model params when needed
+    Split (shard) the layers and optimizer states equally between GPUs (ranks).
+    Pass the full set of batches for activations and gradient activations between layers.
+    Additionally, explore how passing only a subset of batches for activations and gradient activations between layers affects performance (in terms of memory usage and e2e time)
+
+    Coordinate the forward and backward passes across multiple GPUs in a pipelined manner. Verify the pipelined nature of the training using `visualize.py`.
+
+    Use `model.send` and `model.receive` to pass data between different ranks. See `lib.py` for more details on these functions.
     """
+    
     weights, opt_states, activations, grad_activations, grad_weights = model.storage()
     rank=model.rank
-    grad_weights_sharded = [None]*model.num_layers
-    weights_sharded = {}
 
     for l in range(model.num_layers):
-        weights_sharded[l],opt_states[l]=model.load_weights(l,shard=rank,num_shards=model.world_size)
+        weights[l],opt_states[l]=model.load_weights(l)
     
-    for microbatch in get_next_microbatch(
-        model.global_batch_size,model.world_size,batch_size,model.rank
-    ):
-        activations[0] = model.get_input_activation(microbatch)
-
-        for l in range(model.num_layers):
-            weights[l] = await model.all_gather(weights_sharded[l],l)
-            activations[l + 1] = model.forward(l, activations[l], weights[l])
+    for microbatch in get_global_batch_list(model.global_batch_size,model.global_batch_size):
         
-        grad_activations[model.num_layers] = model.loss(activations[model.num_layers])
+        if rank!=0:
+            activations[0] = await model.receive(source=rank-1)
+        else:
+            activations[0] = model.get_input_activation(microbatch)
+        
+        for l in range(model.num_layers):
+            activations[l + 1] = model.forward(l, activations[l], weights[l])
+
+        if rank != model.world_size-1:
+            await model.send(rank+1,activations[model.num_layers])
+            grad_activations[model.num_layers] = await model.receive(rank+1)
+        else:
+            grad_activations[model.num_layers] = model.loss(activations[model.num_layers])
+        
         for l in range(model.num_layers - 1, -1, -1):
             grad_weights[l], grad_activations[l] = model.backward(
                 l, activations[l], grad_activations[l + 1], weights[l]
             )
-            
-            del grad_activations[l + 1], activations[l], weights[l]
-            g_shard =await model.reduce_scatter(grad_weights[l],l)
-            if grad_weights_sharded[l] == None:
-                grad_weights_sharded[l]=g_shard
-            else:
-                grad_weights_sharded[l]+=g_shard
-            del grad_weights[l]
-            del g_shard
+            # Remember to delete the activations to save memory
+            if l!=0:
+                del grad_activations[l + 1], activations[l]
         
-
+        if rank!=0:
+            await model.send(rank-1,grad_activations[0])
+            del grad_activations[0],activations[0]
+        
     for l in range(model.num_layers):
-        weights[l]=weights_sharded[l]
-        grad_weights[l] = grad_weights_sharded[l]
         weights[l], opt_states[l] = model.update(
             l, grad_weights[l], weights[l], opt_states[l]
         )
-        model.set_final_weight(l,weights[l])
+        model.set_final_weight(l, weights[l])
     return model
+
+        
+    
+
+
+
+async def main():
+    world_size = 4
+    num_layers = 16
+    global_batch_size = 2048
+
+    dist = Dist(world_size)
+    models: List[Model] = [
+        Model(rank, dist, num_layers, global_batch_size) for rank in range(world_size)
+    ]
+
+    theoretical_time = get_model_theoretical_best_time(models[0])
+
+    out = await asyncio.gather(*(part2_training_loop(model) for model in models))
+
+    time, memory, max_mem_rank = get_training_stats(out)
+
+    mfu = (theoretical_time / time) * 100
+
+    print(f"MFU: {mfu}")
+
+    write_chrome_trace(out, "./debug_traces/part2.json")
+
+    print(time, memory, max_mem_rank)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
