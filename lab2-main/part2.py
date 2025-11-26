@@ -24,39 +24,49 @@ async def part2_training_loop(model: Model) -> Model:
     
     weights, opt_states, activations, grad_activations, grad_weights = model.storage()
     rank=model.rank
+    layer_per_rank = model.num_layers // model.world_size
+    start = rank * layer_per_rank
+    end = start + layer_per_rank
 
-    for l in range(model.num_layers):
+    for l in range(start, end):
         weights[l],opt_states[l]=model.load_weights(l)
     
-    for microbatch in get_global_batch_list(model.global_batch_size,model.global_batch_size):
+    for microbatch in get_global_batch_list(model.global_batch_size,16):
         
         if rank!=0:
-            activations[0] = await model.receive(source=rank-1)
+            activations[start] = await model.receive(source=rank-1)
         else:
-            activations[0] = model.get_input_activation(microbatch)
+            activations[start] = model.get_input_activation(microbatch)
         
-        for l in range(model.num_layers):
+
+        for l in range(start, end):
             activations[l + 1] = model.forward(l, activations[l], weights[l])
 
         if rank != model.world_size-1:
-            await model.send(rank+1,activations[model.num_layers])
-            grad_activations[model.num_layers] = await model.receive(rank+1)
+            await model.send(rank+1,activations[end])
+            grad_activations[end] = await model.receive(rank+1)
         else:
-            grad_activations[model.num_layers] = model.loss(activations[model.num_layers])
+            grad_activations[end] = model.loss(activations[end])
         
-        for l in range(model.num_layers - 1, -1, -1):
-            grad_weights[l], grad_activations[l] = model.backward(
+        for l in range(end - 1, start - 1, -1):
+            grad_w, grad_activations[l] = model.backward(
                 l, activations[l], grad_activations[l + 1], weights[l]
             )
+            if l not in grad_weights.keys():
+                grad_weights[l] = grad_w
+            else:
+                grad_weights[l] += grad_w
+            del grad_w
+
             # Remember to delete the activations to save memory
-            if l!=0:
+            if l != start:
                 del grad_activations[l + 1], activations[l]
         
         if rank!=0:
-            await model.send(rank-1,grad_activations[0])
-            del grad_activations[0],activations[0]
+            await model.send(rank-1,grad_activations[start])
+            del grad_activations[start],activations[start]
         
-    for l in range(model.num_layers):
+    for l in range(start, end):
         weights[l], opt_states[l] = model.update(
             l, grad_weights[l], weights[l], opt_states[l]
         )
